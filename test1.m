@@ -2,11 +2,14 @@ clear, clc;
 
 x_0 = [1; 2; 3]; 
 x_1 = [100; 200; 300];
-x_sensor = [-45; 567; -456];
+x_source = [-45; 567; -456];
 
-N = [5, 10, 15, 25, 35, 50, 75, 100, 250];
+N = [15, 25, 35, 45, 55];%, 50, 75, 100, 250];
 Errors= [];
 Ranks = [];
+
+
+Mats = cell(1, 3);
 for j=1:length(N)
     
     n = N(j);
@@ -16,26 +19,38 @@ for j=1:length(N)
     plot3(x_traj(1,:), x_traj(2,:), x_traj(3,:), 'LineWidth', 2);
     grid on;
     hold on;
-    plot3(x_sensor(1,:), x_sensor(2,:), x_sensor(3,:), 'ro', 'LineWidth', 2);
+    plot3(x_source(1,:), x_source(2,:), x_source(3,:), 'ro', 'LineWidth', 2);
     hold on;
     xlabel('X'); ylabel('Y'); zlabel('Z');
     title('Generated 3D Trajectory');
     
-    x_angles = calc_angles(x_traj, x_sensor, x_heading);
+    x_angles = calc_angles(x_traj, x_source, x_heading);
     
     
-    [u_opt, Z ] = sdp(x_traj, x_heading, x_angles, n);
+    [u_opt, Z, mat ] = sdp(x_traj, x_heading, x_angles, n);
     plot3(u_opt(1,:), u_opt(2,:), u_opt(3,:), 'go', 'LineWidth', 2);
+    text(u_opt(1,:), u_opt(2,:), u_opt(3,:), string(j) , 'FontSize', 15);
     grid on;
     hold on;
 
-    Errors(end+1) = norm(u_opt-x_sensor);
+    Errors(end+1) = norm(u_opt-x_source);
     Ranks(end+1) = rank(Z);
+
+    E = eig(mat);
+    c = cond(mat);
+    disp("-----")
+    disp(mat)
+    disp(norm(mat))
+    disp(E)
+    disp(c)
+    disp("-------------")
 end
 
 
 
-
+disp(Errors)
+disp("-------")
+disp(Ranks)
 
 
 
@@ -86,7 +101,7 @@ function [x, T] = traj_gen(n, p0, p3, alpha1, alpha2, K1, K2)
 end
 
 
-function [u_opt, Z ] = sdp(x_traj, x_heading, x_angles, N)
+function [u_opt, Z , mat] = sdp(x_traj, x_heading, x_angles, N)
 
     n=N;
     idx_u = 1:3;
@@ -125,15 +140,11 @@ function [u_opt, Z ] = sdp(x_traj, x_heading, x_angles, N)
         Z(idx_r(i),idx_1) >= 0;
 
     end
-    
-    u_opt = Z(idx_u, idx_1);% Z(1:3,n+4)
-    %history.cvx_status  = cvx_status;
-    %history.cvx_optval  = cvx_optval;
-    %history.cvx_cputime = cvx_cputime;
-    %history.Z = Z;
     cvx_end
 
-end
+    u_opt = Z(idx_u, idx_1);% Z(1:3,n+4)
+    mat = Z(idx_u, idx_u) - u_opt * u_opt';
 
+end
 
 
