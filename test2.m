@@ -7,7 +7,7 @@ rho    = 1e-6;
 
 x_0      = [1; 2; 3];
 x_1      = [100; 200; 300];
-x_source = [-45; 567; -456];
+x_source = [-4500; 5067; -456];
 
 %% ===================== STORAGE ========================
 % Results will be stored as:
@@ -34,8 +34,8 @@ for m = 1:M
         [x_traj, x_heading] = traj_gen(n, x_0, x_1, 0.15, 0.85, 0.15, 0.85);
         x_angles = calc_angles(x_traj, x_source, x_heading);
         
-        % Solve the SDP ---> use either sdp1 or sdp2 as the solver of the optim problem  
-        [u_opt, Z, mat] = sdp2(x_traj, x_heading, x_angles, n, rho); % ------------------------------------------------
+        % Solve the SDP
+        [u_opt, Z, mat] = sdp4(x_traj, x_heading, x_angles, n, rho); % ------------------------------------------------
         
         % ----- record important quantities -----
         Error(m,j)  = norm(u_opt - x_source);
@@ -251,4 +251,88 @@ function [u_opt, Z, mat] = sdp2(x_traj, x_heading, x_angles, N, rho)
     % final extraction
     u_opt = v(idx_u);               % or Z(idx_u,idx_1)
     mat   = Z(idx_u,idx_u) - u_opt*u_opt';
+end
+
+
+function [u_opt, Z, mat] = sdp4(x_traj, x_heading, x_angles, N, rho)
+    n = N;
+    idx_u = 1:3;
+    idx_r = 4:3+n;
+    idx_1 = n+4;
+    dim  = idx_1;
+    
+    C = zeros(dim);
+    for i = 1:n
+        c_i = zeros(dim,1);
+        c_i(idx_u)    = -sin(x_angles(i)) * x_heading(:,i);
+        c_i(idx_r(i)) =  cos(x_angles(i));
+        c_i(idx_1)    =  sin(x_angles(i)) * (x_heading(:,i)' * x_traj(:,i));
+        C = C + c_i * c_i';
+    end
+    
+    % ---------- Initial standard SDP solve ----------
+    cvx_begin sdp quiet
+    variable Z(dim,dim) symmetric
+    minimize( trace(C*Z) + rho*trace(Z) )
+    subject to
+    Z == semidefinite(dim);
+    Z(idx_1,idx_1) == 1;
+    for i = 1:n
+        P_i = eye(3) - x_heading(:,i)*x_heading(:,i)';
+        Z(idx_r(i),idx_r(i)) == ...
+            trace(P_i*Z(idx_u,idx_u)) ...
+            - 2*x_traj(:,i)'*P_i*Z(idx_u,idx_1) ...
+            + x_traj(:,i)'*P_i*x_traj(:,i);
+        Z(idx_r(i),idx_1) >= 0;
+    end
+    cvx_end
+    
+    % -------------------
+    max_iter = 15;
+    mu = rho; % Initial penalty weight for rank encouragement
+    
+    % Extract initial principal eigenvector v_k
+    [V, D] = eig(Z);
+    [~, idx] = max(diag(D));
+    v_k = V(:, idx);
+    v_k = v_k / norm(v_k);
+    
+    for iter = 1:max_iter
+        % Fix v_k and optimize Z with linear penalty -trace(v_k*v_k' * Z)
+        cvx_begin sdp quiet
+        variable Z(dim,dim) symmetric
+        % Penalizes all minor eigenvalues: trace(Z) - v_k'*Z*v_k
+        minimize( trace(C*Z) + mu * (trace(Z) - trace((v_k * v_k') * Z)) )
+        subject to
+        Z == semidefinite(dim);
+        Z(idx_1,idx_1) == 1;
+        for i = 1:n
+            P_i = eye(3) - x_heading(:,i)*x_heading(:,i)';
+            Z(idx_r(i),idx_r(i)) == ...
+                trace(P_i*Z(idx_u,idx_u)) ...
+                - 2*x_traj(:,i)'*P_i*Z(idx_u,idx_1) ...
+                + x_traj(:,i)'*P_i*x_traj(:,i);
+            Z(idx_r(i),idx_1) >= 0;
+        end
+        cvx_end
+    
+        % updating v_k as the principal eigenvector of the updated Z
+        [V, D] = eig(Z);
+        [~, idx] = max(diag(D));
+        v_k = V(:, idx);
+        v_k = v_k / norm(v_k);
+    
+        % gradually increasing penalty factor --> to get rank=1 constraint
+        mu = mu * 1.2;
+    end
+    
+    % checking the value of v(n+4) to be +1
+    if v_k(idx_1) < 0
+        v_k = -v_k;
+    end
+    v_k = v_k / v_k(idx_1);
+    
+    % extracting u_opt from final Z 
+    u_opt = v_k(idx_u);
+    mat   = Z(idx_u,idx_u) - u_opt * u_opt';
 end
