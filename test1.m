@@ -2,8 +2,10 @@ clear, clc;
 
 x_0 = [1; 2; 3]; 
 x_1 = [100; 200; 300];
+%x_source = [45; -822; 322];
 %x_source = [-45; 567; -456];
-x_source = [-45; 567; -456];
+%x_source = [1200; -567; -900];
+x_source = [-5000; -2000; 4000];
 
 N = [15, 25, 35, 45, 55];%, 50, 75, 100, 250];
 Errors= [];
@@ -11,6 +13,7 @@ Ranks = [];
 
 
 Mats = cell(1, 3);
+figure;
 for j=1:length(N)
     
     n = N(j); rho = 0.000001;
@@ -28,7 +31,7 @@ for j=1:length(N)
     x_angles = calc_angles(x_traj, x_source, x_heading);
     
     
-    [u_opt, Z, mat ] = sdp(x_traj, x_heading, x_angles, n, rho);
+    [u_opt, Z, mat ] = sdp4(x_traj, x_heading, x_angles, n, rho);
     plot3(u_opt(1,:), u_opt(2,:), u_opt(3,:), 'go', 'LineWidth', 2);
     text(u_opt(1,:), u_opt(2,:), u_opt(3,:), string(j) , 'FontSize', 15);
     grid on;
@@ -114,7 +117,8 @@ function [x, T] = traj_gen(n, p0, p3, alpha1, alpha2, K1, K2)
     T = dx ./ speed;
 end
 
-
+%%
+% The original SDP problem without considering the noise
 function [u_opt, Z , mat] = sdp(x_traj, x_heading, x_angles, N, rho)
 
     n=N;
@@ -161,7 +165,7 @@ function [u_opt, Z , mat] = sdp(x_traj, x_heading, x_angles, N, rho)
 
 end
 
-
+% getting rank1 approximation of the original SDP problem
 function [u_opt, Z, mat] = sdp2(x_traj, x_heading, x_angles, N, rho)
     n = N;
     idx_u = 1:3;
@@ -169,7 +173,6 @@ function [u_opt, Z, mat] = sdp2(x_traj, x_heading, x_angles, N, rho)
     idx_1 = n+4;
     dim  = idx_1;
     
-    % Build the constant matrix C
     C = zeros(dim);
     for i = 1:n
         c_i = zeros(dim,1);
@@ -179,10 +182,175 @@ function [u_opt, Z, mat] = sdp2(x_traj, x_heading, x_angles, N, rho)
         C = C + c_i * c_i';
     end
     
-    % ---------- initial SDP solve for Z ----------
+    % ---------> rank 1 approximation of the SDP
     cvx_begin sdp quiet
     variable Z(dim,dim) symmetric
     minimize( trace(C*Z) + rho*trace(Z) )
+    subject to
+    Z == semidefinite(dim);
+    Z(idx_1,idx_1) == 1;
+
+    for i = 1:n
+        P_i = eye(3) - x_heading(:,i)*x_heading(:,i)';
+        Z(idx_r(i),idx_r(i)) == ...
+        trace(P_i*Z(idx_u,idx_u)) ...
+        - 2*x_traj(:,i)'*P_i*Z(idx_u,idx_1) ...
+        + x_traj(:,i)'*P_i*x_traj(:,i);
+        Z(idx_r(i),idx_1) >= 0;
+    end
+    cvx_end
+    
+    
+    [V,D] = eig(Z);
+    [~,idx] = max(abs(diag(D)));
+    v = V(:,idx);
+    % checking the value of v(n+4) to be +1 
+    if v(idx_1) < 0
+        v = -v;
+    end
+    v = v / v(idx_1);  
+    
+    
+    % final extraction
+    u_opt = v(idx_u);               
+    mat   = Z(idx_u,idx_u) - u_opt*u_opt';
+end
+
+
+function [u_opt, Z, mat] = sdp3(x_traj, x_heading, x_angles, N, rho)
+% SDP3  Alternating optimization on the augmented matrix
+%       Phi = [Z , v;  v' , 1]
+%
+%   First solve the ordinary SDP, then alternate:
+%       (1) fix v  →  re-optimize Z  (with Phi ≽ 0)
+%       (2) fix Z  →  extract new v  (principal eigenvector)
+%   until convergence or max_iter is reached.
+
+n     = N;
+idx_u = 1:3;
+idx_r = 4:3+n;
+idx_1 = n+4;
+dim   = idx_1;
+
+% -------------------- build C --------------------
+C = zeros(dim);
+for i = 1:n
+    c_i          = zeros(dim,1);
+    c_i(idx_u)   = -sin(x_angles(i)) * x_heading(:,i);
+    c_i(idx_r(i))=  cos(x_angles(i));
+    c_i(idx_1)   =  sin(x_angles(i)) * (x_heading(:,i)'*x_traj(:,i));
+    C = C + c_i*c_i';
+end
+
+% -------------------- initial SDP --------------------
+cvx_begin sdp quiet
+variable Z(dim,dim) symmetric
+minimize( trace(C*Z) + rho*trace(Z) )
+subject to
+Z == semidefinite(dim);
+Z(idx_1,idx_1) == 1;
+for i = 1:n
+    P_i = eye(3) - x_heading(:,i)*x_heading(:,i)';
+    Z(idx_r(i),idx_r(i)) == ...
+        trace(P_i*Z(idx_u,idx_u)) ...
+        - 2*x_traj(:,i)'*P_i*Z(idx_u,idx_1) ...
+        + x_traj(:,i)'*P_i*x_traj(:,i);
+    Z(idx_r(i),idx_1) >= 0;
+end
+cvx_end
+
+% initialise v from the last column of Z
+v = Z(:,idx_1);
+if v(idx_1) < 0, v = -v; end
+v = v / v(idx_1);          % force homogeneous coordinate = 1
+
+% -------------------- alternating loop --------------------
+max_iter = 12;
+for iter = 1:max_iter
+
+    % ---- (A) fix v, re-optimise Z with Phi ≽ 0 ----
+    cvx_begin sdp quiet
+    variable Z(dim,dim) symmetric
+    minimize( trace(C*Z) + rho*trace(Z) )
+    subject to
+    % the key new constraint:  Phi = [Z , v; v' , 1] ≽ 0
+    [Z , v; v' , 1] == semidefinite(dim+1);
+
+    Z(idx_1,idx_1) == 1;
+    for i = 1:n
+        P_i = eye(3) - x_heading(:,i)*x_heading(:,i)';
+        Z(idx_r(i),idx_r(i)) == ...
+            trace(P_i*Z(idx_u,idx_u)) ...
+            - 2*x_traj(:,i)'*P_i*Z(idx_u,idx_1) ...
+            + x_traj(:,i)'*P_i*x_traj(:,i);
+        Z(idx_r(i),idx_1) >= 0;
+    end
+    cvx_end
+
+    % ---- (B) fix Z, update v (principal eigenvector) ----
+    [V,D] = eig(full(Z));          % full() in case Z is sparse
+    [~,idx] = max(abs(diag(D)));
+    v = V(:,idx);
+    if v(idx_1) < 0, v = -v; end
+    v = v / v(idx_1);              % keep last entry = 1
+end
+
+% -------------------- final extraction --------------------
+u_opt = v(idx_u);
+mat   = Z(idx_u,idx_u) - u_opt*u_opt';
+end
+
+
+
+function [u_opt, Z, mat] = sdp4(x_traj, x_heading, x_angles, N, rho)
+n = N;
+idx_u = 1:3;
+idx_r = 4:3+n;
+idx_1 = n+4;
+dim  = idx_1;
+
+C = zeros(dim);
+for i = 1:n
+    c_i = zeros(dim,1);
+    c_i(idx_u)    = -sin(x_angles(i)) * x_heading(:,i);
+    c_i(idx_r(i)) =  cos(x_angles(i));
+    c_i(idx_1)    =  sin(x_angles(i)) * (x_heading(:,i)' * x_traj(:,i));
+    C = C + c_i * c_i';
+end
+
+% ---------- Initial standard SDP solve ----------
+cvx_begin sdp quiet
+variable Z(dim,dim) symmetric
+minimize( trace(C*Z) + rho*trace(Z) )
+subject to
+Z == semidefinite(dim);
+Z(idx_1,idx_1) == 1;
+for i = 1:n
+    P_i = eye(3) - x_heading(:,i)*x_heading(:,i)';
+    Z(idx_r(i),idx_r(i)) == ...
+        trace(P_i*Z(idx_u,idx_u)) ...
+        - 2*x_traj(:,i)'*P_i*Z(idx_u,idx_1) ...
+        + x_traj(:,i)'*P_i*x_traj(:,i);
+    Z(idx_r(i),idx_1) >= 0;
+end
+cvx_end
+
+% ---------- Penalty-CCP Loop (Linearized Rank Penalty) ----------
+max_iter = 15;
+mu = rho; % Initial penalty weight for rank encouragement
+
+% Extract initial principal eigenvector v_k
+[V, D] = eig(Z);
+[~, idx] = max(diag(D));
+v_k = V(:, idx);
+v_k = v_k / norm(v_k);
+
+for iter = 1:max_iter
+    % Fix v_k and optimize Z with linear penalty -trace(v_k*v_k' * Z)
+    cvx_begin sdp quiet
+    variable Z(dim,dim) symmetric
+    % Penalizes all minor eigenvalues: trace(Z) - v_k'*Z*v_k
+    minimize( trace(C*Z) + mu * (trace(Z) - trace((v_k * v_k') * Z)) )
     subject to
     Z == semidefinite(dim);
     Z(idx_1,idx_1) == 1;
@@ -195,44 +363,24 @@ function [u_opt, Z, mat] = sdp2(x_traj, x_heading, x_angles, N, rho)
         Z(idx_r(i),idx_1) >= 0;
     end
     cvx_end
-    
-    % ---------- coordinate / alternating descent: Z <-> v ----------
-    max_iter = 15;          % number of outer alternations
-    v = Z(:,idx_1);         % initial vector (last column of Z)
-    v = v / norm(v);        % normalise so that v(end) ≈ 1
-    
-    for iter = 1:max_iter
-        % ---- (1) fix v, re-optimise Z (still SDP but warm-started) ----
-        cvx_begin sdp quiet
-        variable Z(dim,dim) symmetric
-        minimize( trace(C*Z) + rho*trace(Z) )
-        subject to
-        Z == semidefinite(dim);
-        Z(idx_1,idx_1) == 1;
-        % soft rank-1 encouragement: force Z close to v*v'
-        % (can be strengthened by adding ||Z - v*v'||_* or a penalty)
-        for i = 1:n
-            P_i = eye(3) - x_heading(:,i)*x_heading(:,i)';
-            Z(idx_r(i),idx_r(i)) == ...
-                trace(P_i*Z(idx_u,idx_u)) ...
-                - 2*x_traj(:,i)'*P_i*Z(idx_u,idx_1) ...
-                + x_traj(:,i)'*P_i*x_traj(:,i);
-            Z(idx_r(i),idx_1) >= 0;
-        end
-        cvx_end
-    
-        % ---- (2) fix Z, update v by principal eigenvector of Z ----
-        [V,D] = eig(Z);
-        [~,idx] = max(abs(diag(D)));
-        v = V(:,idx);
-        % enforce the homogeneous coordinate ≈ +1
-        if v(idx_1) < 0
-            v = -v;
-        end
-        v = v / v(idx_1);   % scale so that last entry = 1
-    end
-    
-    % final extraction
-    u_opt = v(idx_u);               % or Z(idx_u,idx_1)
-    mat   = Z(idx_u,idx_u) - u_opt*u_opt';
+
+    % updating v_k as the principal eigenvector of the updated Z
+    [V, D] = eig(Z);
+    [~, idx] = max(diag(D));
+    v_k = V(:, idx);
+    v_k = v_k / norm(v_k);
+
+    % gradually increasing penalty factor --> to get rank=1 constraint
+    mu = mu * 1.2;
+end
+
+% checking the value of v(n+4) to be +1
+if v_k(idx_1) < 0
+    v_k = -v_k;
+end
+v_k = v_k / v_k(idx_1);
+
+% extracting u_opt from final Z 
+u_opt = v_k(idx_u);
+mat   = Z(idx_u,idx_u) - u_opt * u_opt';
 end
